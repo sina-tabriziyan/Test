@@ -1,0 +1,240 @@
+public class WebSocketManager extends WebSocketListener {
+    @Inject
+    LoginActivityViewModel loginActivityViewModel;
+    @Inject
+    WebSocketNotification socketNotification;
+    @Inject
+    SharedPreferencesManager sharedPreferencesManager;
+    RxEventBus rxEventBus;
+    DataManager dataManager;
+    Context context;
+    String domain, lastPingStatus = "";
+    int timer = 60000;
+    public static WebSocket newSocket;
+    Handler handlerReconnect;
+    Runnable runReconnect;
+    public static boolean stopSocket;
+
+    public WebSocketManager(Application app, RxEventBus rxEventBus, DataManager dataManager) {
+        ((MyApplication) app).getAppComponent().inject(this);
+        this.rxEventBus = rxEventBus;
+        this.dataManager = dataManager;
+        this.context = app;
+    }
+
+    private void socketHandler() throws IOException {
+
+        createSocket();
+
+        final Handler handlerPing = new Handler();
+        handlerPing.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (newSocket != null && lastPingStatus.equals("Recieved")) {
+                    ping();
+                }
+                handlerPing.postDelayed(this, timer);
+            }
+        }, timer);
+
+        handlerReconnect = new Handler();
+        runReconnect = new Runnable() {
+            @Override
+            public void run() {
+                newSocket = null;
+                try {
+                    createSocket();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+
+            }
+        };
+    }
+
+
+
+    //Socket Open
+    @Override
+    public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
+        Log.e("socket", "onOpen");
+        if (response.code() == 101) {
+            ping();
+        }
+
+        super.onOpen(webSocket, response);
+    }
+
+    //Socket Recieve Message
+    @Override
+    public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
+        Log.e("socket", "onMessage");
+
+        PingResponseModel pingMsg = new Gson().fromJson(text, PingResponseModel.class);
+        if (pingMsg != null) {
+            lastPingStatus = "Recieved";
+            Log.e("socket", "pong");
+        }
+        Log.i("sikoslllla", "onMessage: " + text);
+        switch (pingMsg.getModuleId()) {
+            case ConstValues.MODULE_ID_HOME:
+                if (sharedPreferencesManager.getCurrentActivity().equals(AllChatActivity.class.getSimpleName())) {
+                    rxEventBus.send(new WebSocketAllChatFragmentEvent(pingMsg));
+                    rxEventBus.send(new WebSocketChatFragmentEvent(pingMsg));
+                    return;
+                } else
+                    socketNotifyAction(pingMsg);
+                break;
+            case ConstValues.MODULE_ID_CHAT:
+                if (((pingMsg.getEventType() & 2) == ConstValues.WEB_SOCKET_EVENT_IS_CHANGE_TOPIC) ||
+                        (pingMsg.getEventType() & 4) == ConstValues.WEB_SOCKET_EVENT_IS_TYPING
+                        || (pingMsg.getEventType() & 8) == ConstValues.WEB_SOCKET_EVENT_REMOVE_IS_TYPING)
+                    rxEventBus.send(new WebSocketAllChatFragmentEvent(pingMsg));
+                rxEventBus.send(new WebSocketChatFragmentEvent(pingMsg));
+                break;
+        }
+
+        super.onMessage(webSocket, text);
+    }
+
+    //Socket Closed
+    @Override
+    public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+        Log.e("socket", "onClosed");
+        if (code != 1005)
+            webSocket.close(code, null);
+        super.onClosed(webSocket, code, reason);
+    }
+
+    //Socket Closing
+    @Override
+    public void onClosing(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+        Log.e("socket", "onClosing");
+        super.onClosing(webSocket, code, reason);
+    }
+
+    //Socket Disconnected From Server
+    @Override
+    public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable
+            t, @Nullable Response response) {
+        if (response != null) {
+            Log.e("socket", "onFailure" + response.code());
+
+            if (response.code() == 200 && response.networkResponse().header("Content-Location").contains("login")) {
+                autoLogin();
+                stopSocketConnection();
+            }
+        } else {
+            if (!stopSocket && handlerReconnect != null)
+                handlerReconnect.postDelayed(runReconnect, 10000);
+        }
+
+        super.onFailure(webSocket, t, response);
+    }
+
+    // Create Socket And Request To Connect Server
+    public void createSocket() throws IOException {
+        Log.e("socket", "created");
+        if (newSocket == null) {
+            domain = sharedPreferencesManager.getActiveDomain().replace("https://", "");
+            Request request = new Request.Builder()
+                    .url("wss://" + domain + "events/get/")
+                    .addHeader("Cookie", sharedPreferencesManager.getSid())
+                    .build();
+
+            try {
+                OkHttpClient.Builder builder = new OkHttpClient.Builder();
+                builder = getUnsafeOkHttpClient();
+                OkHttpClient client = builder
+                        .readTimeout(30000, TimeUnit.MILLISECONDS)
+                        .connectTimeout(30000, TimeUnit.MILLISECONDS)
+                        .retryOnConnectionFailure(true)
+                        .build();
+
+                newSocket = client.newWebSocket(request, this);
+                stopSocket = false;
+
+                if (socketNotification == null)
+                    socketNotification = new WebSocketNotification(context, dataManager);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public void startSocketConnection(String... args) throws IOException {
+        socketHandler();
+    }
+
+    //Send Ping Message To Check Connection To Server
+    public void ping() {
+        if (newSocket != null) {
+            Log.e("socket", "ping");
+            newSocket.send("PING");
+            lastPingStatus = "Send";
+        }
+    }
+
+    //Stop And Close Socket Connection
+    public void stopSocketConnection() {
+        if (newSocket != null) {
+            newSocket.close(1000, null);
+            newSocket = null;
+            stopSocket = true;
+            socketNotification = null;
+        }
+    }
+
+    public void autoLogin() {
+        String loginTimeWarning = sharedPreferencesManager.getUser().get(sharedPreferencesManager.getUser().size() - 1).getLoginTimes();
+        if (!loginTimeWarning.equals("0") && (int) ((new Date().getTime() - Long.valueOf(loginTimeWarning)) / (60 * 1000)) < 60) {
+            loginActivityViewModel.setError(getString(R.string.delete_old_session_error_message));
+            logoutUser();
+        } else {
+            //  GoneWebView();
+            loginActivityViewModel.readDataForAutoLogin(context);
+        }
+    }
+
+    private void logoutUser() {
+        sharedPreferencesManager.deleteSid();
+        try {
+            Call<ResponseBody> call = dataManager.logoutWithCall();
+            APIHelper.enqueueWithRetry(call, 0, new Callback<ResponseBody>() {
+                @Override
+                public void onResponse(@NotNull Call<ResponseBody> call, @NotNull retrofit2.Response<ResponseBody> response) {
+                    dataManager.logoutUser_DB().subscribeOn(Schedulers.io()).subscribe(() -> {
+                    });
+                    stopSocketConnection();
+                }
+
+                @Override
+                public void onFailure(@NotNull Call<ResponseBody> call, @NotNull Throwable t) {
+                }
+            });
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void socketNotifyAction(PingResponseModel pingResponseModel) {
+        if (socketNotification == null)
+            socketNotification = new WebSocketNotification(context, dataManager);
+
+        if (pingResponseModel.getContent() != null) {
+            Notify notify = new Gson().fromJson(pingResponseModel.getContent(), Notify.class);
+
+            switch (pingResponseModel.getEventType()) {
+                case 256:
+                    if (!(sharedPreferencesManager.getCurrentActivity().equals(MainActivity.class.getSimpleName()) && Foreground.get().isForeground()))
+                        socketNotification.startGetNotify(notify);
+                    break;
+                case 512:
+                    socketNotification.deleteNotifyFromAllNotification(notify);
+                    break;
+            }
+        }
+    }
+
+}
