@@ -235,3 +235,154 @@ class WebSProvider(
     }
 }
 
+//
+class WebsocketService : Service() {
+    @Inject
+    lateinit var sharePref: SharePref
+
+    @Inject
+    lateinit var socketRepository: SocketRepository
+
+    @Inject
+    lateinit var baseVm: BaseVm
+
+    lateinit var webSProvider: WebSProvider
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        (application as TeamyarApplication).applicationGraph.inject(this)
+        webSProvider = initialWebSProvider()
+        webSProvider.startSocket()
+    }
+
+    @SuppressLint("MissingPermission")
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val notificationCompat = NotificationCompat.Builder(this, TeamyarApplication.CHANNEL_ID).setSmallIcon(R.drawable.logo)
+            .setContentTitle(getString(R.string.app_name)).build()
+
+        setupPing()
+
+        GlobalScope.launch {
+            WebsocketListener.notifyEventChannel.consumeEach { socketResponse ->
+                    socketResponse.content?.let {
+                        val content: NotifyContent? = socketResponse.toContent()
+                       var notificationsId= content?.let { it1 -> notificationId(it1) }
+                        var showNotification=true
+                        if (notificationsId == 2) {
+                            if (!baseVm.notifyType(SharePrefConstant.NOTIFY_SPECIAL)) {
+                                showNotification = false
+                            }
+                        }
+
+                        if (notificationsId == 3) {
+                            if (!baseVm.notifyType(SharePrefConstant.NOTIFY_NORMAL)) {
+                                showNotification = false
+                            }
+                        }
+
+                        if (notificationsId == 4) {
+                            if (!baseVm.notifyType(SharePrefConstant.NOTIFY_UNIMPORTANT)) {
+                                showNotification = false
+                            }
+                        }
+
+                        if (showNotification) {
+                            val builder = NotificationCompat.Builder(this@WebsocketService,
+                                TeamyarApplication.CHANNEL_ID_UNIMPORTANT)
+                                .setSmallIcon(R.drawable.logo)
+                                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                                .setContent(
+                                    remoteViews(content)
+                                ).build()
+
+                            synchronized(builder) {
+                                PermissionUtils.requestPermission(
+                                    this@WebsocketService,
+                                    permission = arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                                    deniedMsg = resources.getString(R.string.deny_permission_message),
+                                    onPermissionDenied = {
+
+                                    },
+                                    onPermissionGranted = {
+                                        (application as TeamyarApplication).notificationManager.notify(11, builder)
+                                    }
+                                )
+                            }
+                        }
+                    }
+            }
+        }
+
+        startForeground(1235, notificationCompat)
+        return START_STICKY
+    }
+
+    private fun setupPing() {
+        val timer = Timer()
+
+        timer.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                try {
+                    WebsocketListener.webSocketObj.send("PING")
+                } catch (_: Exception) {
+
+                }
+            }
+        }, 3000, 10000)
+    }
+
+    private fun initialWebSProvider() = WebSProvider(
+        WebsocketInfoModel(
+            "wss://${sharePref.getString(SharePrefConstant.DOMAIN)}/events/get/",
+            sharePref.getString(SharePrefConstant.SID)
+        )
+    )
+
+    private fun remoteViews(content: NotifyContent?): RemoteViews? {
+        return content?.statusMap(resources)?.get("${content.status}")?.let { status ->
+            NotificationHelper.notificationCustomView(
+                content.title!!,
+                convertFiletimeToDate(content.tid!!),
+                status,
+                1,
+                notificationId(content),
+                getStringResourceByName("icon_" + "module" + content.moduleId),
+                this
+            )
+        }
+    }
+
+    private fun notificationId(notifyContent: NotifyContent): Int {
+        val type = checkNotifyType(notifyContent, socketRepository.notifyColor)
+
+        when (type) {
+            "Special" -> return 2
+            "Normal" -> return 3
+            "Unimportant" -> return 4
+            else -> return 4
+        }
+    }
+
+    private fun convertFiletimeToDate(filetime: Long): String {
+        val arrDate: ArrayList<String>
+        val fileTimeConvertor = FileTimeConvertor()
+        arrDate = fileTimeConvertor.Picker(
+            filetime,
+            baseVm.timeZone()!!.toLong(),
+            baseVm.userPrefModel()?.daylightRange,
+            Integer.valueOf(baseVm.userPrefModel()?.calendarType!!)
+        )
+        return arrDate[0] + "/" + arrDate[1] + "/" + arrDate[2] + "   " + arrDate[3] + ":" + arrDate[4]
+    }
+
+    private fun getStringResourceByName(aString: String): String {
+        val packageName: String = this.packageName
+        val resId: Int = this.resources.getIdentifier(aString, "string", packageName)
+        return this.getString(resId)
+    }
+}
+
